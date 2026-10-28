@@ -17,9 +17,10 @@ Environment variables:
 import os
 import re
 import time
+import asyncio
 import sqlite3
 import discord
-from aiohttp import web, ClientSession
+from aiohttp import web, ClientSession, ClientTimeout
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -47,12 +48,28 @@ def points_for_game(player_count: int) -> int:
 if DATABASE_URL:
     import psycopg
 
+    _conn = None
+
     def run(sql: str, params=()):
-        """Runs one query. Returns (rows, rowcount)."""
-        with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
-            cur = conn.execute(sql.replace("?", "%s"), params)
-            rows = cur.fetchall() if cur.description else []
-            return rows, cur.rowcount
+        """Runs one query. Returns (rows, rowcount).
+        Keeps one connection open and reconnects if it dropped (Neon closes it when it sleeps)."""
+        global _conn
+        for attempt in (1, 2):
+            try:
+                if _conn is None or _conn.closed:
+                    # prepare_threshold=None: needed for Neon's connection pooler
+                    _conn = psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=15, prepare_threshold=None)
+                cur = _conn.execute(sql.replace("?", "%s"), params)
+                rows = cur.fetchall() if cur.description else []
+                return rows, cur.rowcount
+            except (psycopg.OperationalError, psycopg.InterfaceError):
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+                if attempt == 2:
+                    raise
 
     GREATEST = "GREATEST"
 else:
@@ -101,6 +118,13 @@ for statement in [
 ]:
     run(statement)
 
+# Newer columns: how many points each claim gave and which button was used.
+for column in ("points INTEGER", "label TEXT", "claimed_at REAL"):
+    try:
+        run(f"ALTER TABLE claims ADD COLUMN {column}")
+    except Exception:
+        pass  # already there
+
 # Move roles made with the older /role_create into the new reward_roles table.
 try:
     run("""INSERT INTO reward_roles (role_id, guild_id, kind, amount, channel_id)
@@ -112,14 +136,25 @@ except Exception:
 
 
 # ---------- settings ----------
+# Kept in memory so the every-minute check doesn't need the database
+# (Neon's free plan only has 100 compute hours a month and sleeps when unused).
+_settings = None
+
+
 def get_setting(key: str, default=None):
-    rows, _ = run("SELECT value FROM settings WHERE key = ?", (key,))
-    return rows[0][0] if rows else default
+    global _settings
+    if _settings is None:
+        _settings = {k: v for k, v in run("SELECT key, value FROM settings")[0]}
+    value = _settings.get(key)
+    return default if value is None else value
 
 
 def set_setting(key: str, value):
+    value = None if value is None else str(value)
     run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        (key, None if value is None else str(value)))
+        (key, value))
+    if _settings is not None:
+        _settings[key] = value
 
 
 def clan_tag() -> str:
@@ -140,8 +175,6 @@ def event_multiplier():
     ends = get_setting("mult_ends")
     ends = float(ends) if ends else None
     if ends and time.time() >= ends:
-        set_setting("mult_value", 1)
-        set_setting("mult_ends", None)
         return 1.0, None
     return value, ends
 
@@ -176,10 +209,49 @@ def get_link(user_id: int):
     return rows[0][0] if rows else None
 
 
-def try_claim(game_id: str, user_id: int) -> bool:
+def try_claim(game_id: str, user_id: int, points: int = 0, label: str = "") -> bool:
     """Marks a game as claimed by this user. False if they already claimed it."""
-    _, count = run("INSERT INTO claims (game_id, user_id) VALUES (?, ?) ON CONFLICT DO NOTHING", (game_id, user_id))
+    _, count = run(
+        "INSERT INTO claims (game_id, user_id, points, label, claimed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+        (game_id, user_id, points, label, time.time()),
+    )
     return count == 1
+
+
+CLAIMED_FIELD = "✅ Claimed by"
+CLAIM_LOCK = asyncio.Lock()
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def claimed_list(game_id: str) -> str:
+    """One line per claim, e.g. '@Fiki — +49 pts (⭐ Solo ×1.5)', in the order they were claimed."""
+    rows, _ = run("SELECT user_id, points, label FROM claims WHERE game_id = ? ORDER BY claimed_at", (game_id,))
+    lines = [f"<@{uid}> — **+{pts or 0}** pts" + (f" ({label})" if label else "") for uid, pts, label in rows]
+    text, shown = "", 0
+    for line in lines:  # embed fields hold at most 1024 characters
+        if len(text) + len(line) + 30 > 1024:
+            break
+        text += line + "\n"
+        shown += 1
+    if shown < len(lines):
+        text += f"…and {len(lines) - shown} more"
+    return text.strip()
+
+
+def with_claims(embed: discord.Embed, game_id: str) -> discord.Embed:
+    """Puts an up-to-date 'Claimed by' list on a win embed."""
+    for i in reversed(range(len(embed.fields))):
+        if embed.fields[i].name.startswith((CLAIMED_FIELD, "✅ Auto-claimed")):
+            embed.remove_field(i)
+    text = claimed_list(game_id)
+    if text:
+        count = text.count("\n") + 1
+        embed.add_field(name=f"{CLAIMED_FIELD} ({count})" if "more" not in text else CLAIMED_FIELD,
+                        value=text, inline=False)
+    return embed
 
 
 # ---------- permissions ----------
@@ -256,8 +328,9 @@ async def update_roles(guild: discord.Guild | None, user_id: int):
                     break
             elif not entry["reached"] and has:
                 await member.remove_roles(role, reason="Dropped below reward milestone")
-        except discord.Forbidden:
-            print("Missing permission to manage roles: give the bot 'Manage Roles' and put its role above the reward roles.")
+        except discord.HTTPException as e:
+            print(f"Couldn't update role {role.name}: {e}. Give the bot 'Manage Roles' "
+                  "and put its role above the reward roles.")
 
 
 # =========================== Log parsing ===========================
@@ -321,26 +394,37 @@ class ClaimButton(discord.ui.DynamicItem[discord.ui.Button], template=r"claim:(?
     async def callback(self, interaction: discord.Interaction):
         if self.gid == "TEST":
             return await interaction.response.send_message("This is a test message, so nothing was claimed.", ephemeral=True)
+        # Answer Discord right away: it only waits 3 seconds, and waking the database can take longer
+        await interaction.response.defer()
+
+        async def reply(text):
+            await interaction.followup.send(text, ephemeral=True)
+
         rows, _ = run("SELECT points FROM games WHERE game_id = ?", (self.gid,))
         if not rows:
-            return await interaction.response.send_message("This game wasn't found.", ephemeral=True)
-        mult = 1.0
+            return await reply("This game wasn't found.")
+        mult, label = 1.0, ""
         if self.name:
-            b, _ = run("SELECT multiplier FROM buttons WHERE name = ?", (self.name,))
+            b, _ = run("SELECT emoji, multiplier FROM buttons WHERE name = ?", (self.name,))
             if not b:
-                return await interaction.response.send_message("That button was removed. Use the normal Claim button.", ephemeral=True)
-            mult = b[0][0]
-        if not try_claim(self.gid, interaction.user.id):
-            return await interaction.response.send_message("You already claimed this win!", ephemeral=True)
+                return await reply("That button was removed. Use the normal Claim button.")
+            emoji, mult = b[0]
+            label = f"{emoji} {self.name} {fmt_mult(mult)}"
         reward = round(rows[0][0] * mult)
+        if not try_claim(self.gid, interaction.user.id, reward, label):
+            return await reply("You already claimed this win!")
         change_stats(interaction.user.id, points=reward, wins=1)
+
+        # Update the win message so everyone sees who claimed and how much.
+        # The lock stops two claims at the same moment from overwriting each other's update.
+        if interaction.message and interaction.message.embeds:
+            async with CLAIM_LOCK:
+                embed = with_claims(interaction.message.embeds[0], self.gid)
+                await interaction.edit_original_response(embed=embed)
+
         await update_roles(interaction.guild, interaction.user.id)
         pts, wins = get_stats(interaction.user.id)
-        extra = f" with **{self.name}** ({fmt_mult(mult)})" if self.name else ""
-        await interaction.response.send_message(
-            f"{interaction.user.mention} claimed **+{reward} points** and **+1 win**{extra} "
-            f"(now {pts} points, {wins} wins)"
-        )
+        await reply(f"You claimed **+{reward} points** and **+1 win** (now {pts} points, {plural(wins, 'win')}).")
 
 
 def claim_view(gid: str, custom: bool = True) -> discord.ui.View:
@@ -388,8 +472,7 @@ STATUS = {"last_check": None, "http": None, "games": 0, "newest": None, "error":
           "posted": 0, "last_post": None, "started": time.time()}
 
 
-def mark_seen(gid: str):
-    run("INSERT INTO seen (game_id) VALUES (?) ON CONFLICT DO NOTHING", (gid,))
+POSTED = set()  # wins already handled, so they aren't looked up again while they stay in the log
 
 
 @tasks.loop(seconds=CHECK_EVERY_SECONDS)
@@ -405,7 +488,7 @@ async def check_log():
 
 async def check_log_once():
     STATUS["last_check"] = time.time()
-    async with bot.http_session.get(LOG_URL, headers={"User-Agent": "Mozilla/5.0 (MPOW clan bot)"}) as resp:
+    async with bot.http_session.get(LOG_URL, headers={"User-Agent": "Mozilla/5.0 (clan wins bot)"}) as resp:
         STATUS["http"] = resp.status
         text = await resp.text()
     if STATUS["http"] != 200:
@@ -417,47 +500,47 @@ async def check_log_once():
     if not games:
         raise RuntimeError(f"Log had no games in it. Start of page: {text[:120]!r}")
 
+    if not winlog_enabled():
+        return
     tag = clan_tag().upper()
+    # Only our clan's wins matter. Other games never touch the database, so Neon can sleep.
+    ours = [g for g in reversed(games) if winning_tag(g) == tag and game_id_of(g) not in POSTED]  # oldest first
+    if not ours:
+        return
     channel = bot.get_channel(win_channel_id())
     if channel is None:
-        # Don't mark anything as seen, so no wins are lost while this is broken
+        # Nothing is marked as handled, so these wins get posted once the channel works again
         raise RuntimeError(f"Can't see the win channel {win_channel_id()}: check the bot can view it, or run /winlog")
-    enabled = winlog_enabled()
-    first_run = run("SELECT COUNT(*) FROM seen")[0][0][0] == 0
 
-    for game in reversed(games):  # oldest first
+    for game in ours:
         gid = game_id_of(game)
-        if run("SELECT 1 FROM seen WHERE game_id = ?", (gid,))[0]:
-            continue  # already handled
-
-        # On the very first run, just remember old games instead of posting them all
-        if first_run or not enabled or winning_tag(game) != tag:
-            mark_seen(gid)
-            continue
-
         contest = game.get("Contest", "No").lower() == "yes"
         players = int(game.get("Player Count", "0") or 0)
         mult, _ = event_multiplier()
         pts = round(points_for_game(players) * mult)
-        run("INSERT INTO games VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-            (gid, game["Map"], int(contest), players, pts))
 
-        embed = win_embed(game, tag, pts, mult)
+        # Saving the game first also stops a second copy of the bot (e.g. during a redeploy) posting it twice
+        _, new = run("INSERT INTO games VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                     (gid, game["Map"], int(contest), players, pts))
+        if new != 1:
+            POSTED.add(gid)  # already posted earlier
+            continue
 
-        # Auto-claim for everyone whose linked account played in this win
-        auto = []
-        for code in winner_codes(game):
-            rows, _ = run("SELECT user_id FROM links WHERE code = ?", (code,))
-            for (uid,) in rows:
-                if try_claim(gid, uid):
-                    change_stats(uid, points=pts, wins=1)
-                    await update_roles(channel.guild, uid)
-                    auto.append(f"<@{uid}>")
-        if auto:
-            embed.add_field(name="✅ Auto-claimed", value=" ".join(auto), inline=False)
-
-        await send_win(channel, embed, gid)
-        mark_seen(gid)
+        try:
+            embed = win_embed(game, tag, pts, mult)
+            # Auto-claim for everyone whose linked account played in this win
+            for code in winner_codes(game):
+                rows, _ = run("SELECT user_id FROM links WHERE code = ?", (code,))
+                for (uid,) in rows:
+                    if try_claim(gid, uid, pts, "auto"):
+                        change_stats(uid, points=pts, wins=1)
+                        await update_roles(channel.guild, uid)
+            with_claims(embed, gid)
+            await send_win(channel, embed, gid)
+        except Exception:
+            run("DELETE FROM games WHERE game_id = ?", (gid,))  # try again on the next check
+            raise
+        POSTED.add(gid)
         STATUS["posted"] += 1
         STATUS["last_post"] = game.get("Time")
 
@@ -469,8 +552,11 @@ async def before_check():
 
 async def start_web_server():
     """Tiny web page so Render sees a web service and a pinger can keep it awake."""
+    async def home(request):
+        return web.Response(text="Bot is running!")
+
     app = web.Application()
-    app.router.add_get("/", lambda request: web.Response(text="Bot is running!"))
+    app.router.add_get("/", home)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
@@ -478,9 +564,11 @@ async def start_web_server():
 
 @bot.event
 async def setup_hook():
-    bot.http_session = ClientSession()
+    bot.http_session = ClientSession(timeout=ClientTimeout(total=20))  # a stuck request can't freeze the checker
     bot.add_dynamic_items(ClaimButton)
     await start_web_server()
+    for command in bot.tree.get_commands():
+        command.guild_only = True  # commands only work inside the server, not in DMs
     await bot.tree.sync()
     check_log.start()
 
@@ -626,7 +714,7 @@ async def change_and_reply(interaction, member, points=0, wins=0, verb=""):
     change_stats(member.id, points=points, wins=wins)
     await update_roles(interaction.guild, member.id)
     pts, w = get_stats(member.id)
-    await interaction.response.send_message(f"{verb} — {member.mention} now has **{pts}** points and **{w}** wins.")
+    await interaction.response.send_message(f"{verb} — {member.mention} now has **{pts}** points and **{plural(w, 'win')}**.")
 
 
 @bot.tree.command(name="add", description="(Manager) Add points to your own account")
@@ -789,6 +877,9 @@ async def rewardrole_setup(interaction: discord.Interaction, type: app_commands.
                            channel: discord.TextChannel | None = None):
     if not await managers_only(interaction):
         return
+    if role.is_default() or role.managed:
+        return await interaction.response.send_message(
+            "That role can't be given out (it's @everyone or belongs to a bot/integration).", ephemeral=True)
     if role >= interaction.guild.me.top_role:
         return await interaction.response.send_message(
             f"I can't give {role.mention} because it's above my role. Move my role higher first.", ephemeral=True)
@@ -876,6 +967,8 @@ async def role_create(interaction: discord.Interaction, name: str, points: app_c
         role = await interaction.guild.create_role(name=name, color=role_color, reason=f"Reward role ({points} pts)")
     except discord.Forbidden:
         return await interaction.followup.send("I need the **Manage Roles** permission to create roles.")
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"Discord wouldn't create the role: {e.text or e}")
     run("INSERT INTO reward_roles (role_id, guild_id, kind, amount, channel_id) VALUES (?, ?, 'points', ?, NULL)",
         (role.id, interaction.guild.id, points))
     await sync_everyone(interaction.guild)
@@ -892,7 +985,7 @@ async def role_delete(interaction: discord.Interaction, role: discord.Role):
     try:
         await role.delete(reason="Reward role removed")
         await interaction.response.send_message(f"Deleted the reward role **{role.name}**.")
-    except discord.Forbidden:
+    except discord.HTTPException:
         await interaction.response.send_message(
             f"**{role.name}** is no longer a reward role, but I couldn't delete it from the server. Delete it manually.")
 
@@ -966,13 +1059,17 @@ async def winlog_test(interaction: discord.Interaction):
     channel = bot.get_channel(win_channel_id())
     if channel is None:
         return await interaction.response.send_message("I can't find the win channel. Set it with /winlog.", ephemeral=True)
+    await interaction.response.defer(ephemeral=True)
     mult, _ = event_multiplier()
     sample = {"Time": "TEST", "Map": "Europe", "Contest": "No", "Player Count": "25"}
     embed = win_embed(sample, clan_tag(), round(points_for_game(25) * mult), mult)
     embed.title = "🧪 TEST — " + embed.title
-    await send_win(channel, embed, "TEST")
+    try:
+        await send_win(channel, embed, "TEST")
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"Couldn't post in {channel.mention}: {e.text or e}", ephemeral=True)
     status = "" if winlog_enabled() else " (Note: win tracking is currently disabled.)"
-    await interaction.response.send_message(f"Sent a test message to {channel.mention}.{status}", ephemeral=True)
+    await interaction.followup.send(f"Sent a test message to {channel.mention}.{status}", ephemeral=True)
 
 
 @bot.tree.command(name="button_add", description="(Manager) Add a custom claim button to win messages")
