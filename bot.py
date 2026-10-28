@@ -383,29 +383,56 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+# What the last check saw, shown by /winlog_status
+STATUS = {"last_check": None, "http": None, "games": 0, "newest": None, "error": None,
+          "posted": 0, "last_post": None, "started": time.time()}
+
+
+def mark_seen(gid: str):
+    run("INSERT INTO seen (game_id) VALUES (?) ON CONFLICT DO NOTHING", (gid,))
+
+
 @tasks.loop(seconds=CHECK_EVERY_SECONDS)
 async def check_log():
+    # Any error is caught and logged, so one bad check never stops the loop.
     try:
-        async with bot.http_session.get(LOG_URL) as resp:
-            text = await resp.text()
+        await check_log_once()
+        STATUS["error"] = None
     except Exception as e:
-        print("Couldn't read the log:", e)
-        return
+        STATUS["error"] = f"{type(e).__name__}: {e}"[:300]
+        print("Win check failed:", STATUS["error"])
+
+
+async def check_log_once():
+    STATUS["last_check"] = time.time()
+    async with bot.http_session.get(LOG_URL, headers={"User-Agent": "Mozilla/5.0 (MPOW clan bot)"}) as resp:
+        STATUS["http"] = resp.status
+        text = await resp.text()
+    if STATUS["http"] != 200:
+        raise RuntimeError(f"territorial.io answered {STATUS['http']}: {text[:120]!r}")
 
     games = parse_log(text)
-    first_run = run("SELECT COUNT(*) FROM seen")[0][0][0] == 0
+    STATUS["games"] = len(games)
+    STATUS["newest"] = games[0].get("Time") if games else None
+    if not games:
+        raise RuntimeError(f"Log had no games in it. Start of page: {text[:120]!r}")
+
     tag = clan_tag().upper()
     channel = bot.get_channel(win_channel_id())
+    if channel is None:
+        # Don't mark anything as seen, so no wins are lost while this is broken
+        raise RuntimeError(f"Can't see the win channel {win_channel_id()}: check the bot can view it, or run /winlog")
     enabled = winlog_enabled()
+    first_run = run("SELECT COUNT(*) FROM seen")[0][0][0] == 0
 
     for game in reversed(games):  # oldest first
         gid = game_id_of(game)
-        _, new = run("INSERT INTO seen (game_id) VALUES (?) ON CONFLICT DO NOTHING", (gid,))
-        if new != 1:
+        if run("SELECT 1 FROM seen WHERE game_id = ?", (gid,))[0]:
             continue  # already handled
 
         # On the very first run, just remember old games instead of posting them all
-        if first_run or not enabled or winning_tag(game) != tag or channel is None:
+        if first_run or not enabled or winning_tag(game) != tag:
+            mark_seen(gid)
             continue
 
         contest = game.get("Contest", "No").lower() == "yes"
@@ -430,6 +457,9 @@ async def check_log():
             embed.add_field(name="✅ Auto-claimed", value=" ".join(auto), inline=False)
 
         await send_win(channel, embed, gid)
+        mark_seen(gid)
+        STATUS["posted"] += 1
+        STATUS["last_post"] = game.get("Time")
 
 
 @check_log.before_loop
@@ -498,6 +528,7 @@ HELP_PAGES = [
         ("/winlog <clan> <channel>", "Set up win tracking"),
         ("/winlog_disable", "Stop posting wins"),
         ("/winlog_test", "Send a test win message"),
+        ("/winlog_status", "See what the win tracker is doing"),
         ("/button_add <name> <emoji> <multiplier>", "Add a claim button"),
         ("/button_remove <name>", "Remove a claim button"),
     ]),
@@ -898,6 +929,34 @@ async def winlog_disable(interaction: discord.Interaction):
         return
     set_setting("winlog_enabled", 0)
     await interaction.response.send_message("Win tracking is off. Turn it back on with /winlog.")
+
+
+@bot.tree.command(name="winlog_status", description="(Manager) See what the win tracker is doing")
+async def winlog_status(interaction: discord.Interaction):
+    if not await managers_only(interaction):
+        return
+    s = STATUS
+    channel = bot.get_channel(win_channel_id())
+    perms = channel.permissions_for(interaction.guild.me) if channel else None
+    can_post = bool(perms and perms.view_channel and perms.send_messages and perms.embed_links)
+
+    def ts(x):
+        return f"<t:{int(x)}:R>" if x else "never"
+
+    ok = s["error"] is None and s["http"] == 200 and can_post and winlog_enabled()
+    embed = discord.Embed(title="📡 Win tracker status " + ("✅" if ok else "⚠️"),
+                          color=discord.Color.green() if ok else discord.Color.orange())
+    embed.add_field(name="Tracking", value=f"[{clan_tag()}]" + ("" if winlog_enabled() else " (disabled)"))
+    embed.add_field(name="Channel", value=(channel.mention if channel else f"❌ can't see {win_channel_id()}")
+                    + ("" if can_post or not channel else "\n❌ missing View / Send / Embed Links"))
+    embed.add_field(name="Bot running since", value=ts(s["started"]))
+    embed.add_field(name="Last check", value=f"{ts(s['last_check'])} · HTTP {s['http'] or '-'}")
+    embed.add_field(name="Games in log", value=f"{s['games']} · newest {s['newest'] or '-'}")
+    embed.add_field(name="Wins posted", value=f"{s['posted']} since start · last {s['last_post'] or '-'}")
+    if s["error"]:
+        embed.add_field(name="Last error", value=f"```{s['error']}```", inline=False)
+    embed.set_footer(text="Log times are GMT (1 hour behind Serbia in winter).")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="winlog_test", description="(Manager) Send a test win message")
